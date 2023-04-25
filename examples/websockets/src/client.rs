@@ -10,118 +10,66 @@
 //! websocket server and how the client-side and server-side code can be quite similar.
 //!
 
-use futures_util::stream::FuturesUnordered;
 use futures_util::{SinkExt, StreamExt};
-use std::borrow::Cow;
 use std::ops::ControlFlow;
 use std::time::Instant;
 
 // we will use tungstenite for websocket client impl (same library as what axum is using)
-use tokio_tungstenite::{
-    connect_async,
-    tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Message},
-};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
-const N_CLIENTS: usize = 2; //set to desired number
 const SERVER: &str = "ws://127.0.0.1:3000/ws";
 
 #[tokio::main]
 async fn main() {
-    let start_time = Instant::now();
-    //spawn several clients that will concurrently talk to the server
-    let mut clients = (0..N_CLIENTS)
-        .map(|cli| tokio::spawn(spawn_client(cli)))
-        .collect::<FuturesUnordered<_>>();
-
-    //wait for all our clients to exit
-    while clients.next().await.is_some() {}
-
-    let end_time = Instant::now();
-
-    //total time should be the same no matter how many clients we spawn
-    println!(
-        "Total time taken {:#?} with {N_CLIENTS} concurrent clients, should be about 6.45 seconds.",
-        end_time - start_time
-    );
-}
-
-//creates a client. quietly exits on failure.
-async fn spawn_client(who: usize) {
     let ws_stream = match connect_async(SERVER).await {
         Ok((stream, response)) => {
-            println!("Handshake for client {} has been completed", who);
+            println!("Handshake for client has been completed");
             // This will be the HTTP response, same as with server this is the last moment we
             // can still access HTTP stuff.
             println!("Server response was {:?}", response);
             stream
         }
         Err(e) => {
-            println!("WebSocket handshake for client {who} failed with {e}!");
+            println!("WebSocket handshake for client failed with {e}!");
             return;
         }
     };
 
     let (mut sender, mut receiver) = ws_stream.split();
 
-    //we can ping the server for start
-    sender
-        .send(Message::Ping("Hello, Server!".into()))
-        .await
-        .expect("Can not send!");
-
     //spawn an async sender to push some more messages into the server
-    let mut send_task = tokio::spawn(async move {
-        for i in 1..30 {
-            // In any websocket error, break loop.
-            if sender
-                .send(Message::Text(format!("Message number {}...", i)))
-                .await
-                .is_err()
-            {
-                //just as with server, if send fails there is nothing we can do but exit.
-                return;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    for i in 1..3 {
+        // In any websocket error, break loop.
+        if sender
+            .send(Message::Binary(
+                format!("Message number {}...", i).as_bytes().to_vec(),
+            ))
+            .await
+            .is_err()
+        {
+            //just as with server, if send fails there is nothing we can do but exit.
+            return;
         }
 
-        // When we are done we may want our client to close connection cleanly.
-        println!("Sending close to {}...", who);
-        if let Err(e) = sender
-            .send(Message::Close(Some(CloseFrame {
-                code: CloseCode::Normal,
-                reason: Cow::from("Goodbye"),
-            })))
-            .await
-        {
-            println!("Could not send Close due to {:?}, probably it is ok?", e);
-        };
-    });
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    }
 
     //receiver just prints whatever it gets
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = receiver.next().await {
-            // print message and break if instructed to do so
-            if process_message(msg, who).is_break() {
-                break;
-            }
-        }
-    });
-
-    //wait for either task to finish and kill the other task
-    tokio::select! {
-        _ = (&mut send_task) => {
-            recv_task.abort();
-        },
-        _ = (&mut recv_task) => {
-            send_task.abort();
+    let mut count = 0;
+    let start = Instant::now();
+    while let Some(Ok(msg)) = receiver.next().await {
+        count += 1;
+        let who = format!("{count} {:?}", start.elapsed());
+        // print message and break if instructed to do so
+        if process_message(msg, who).is_break() {
+            break;
         }
     }
 }
 
 /// Function to handle messages we get (with a slight twist that Frame variant is visible
 /// since we are working with the underlying tungstenite library directly without axum here).
-fn process_message(msg: Message, who: usize) -> ControlFlow<(), ()> {
+fn process_message(msg: Message, who: String) -> ControlFlow<(), ()> {
     match msg {
         Message::Text(t) => {
             println!(">>> {} got str: {:?}", who, t);
